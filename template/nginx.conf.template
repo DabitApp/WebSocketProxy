@@ -1,0 +1,27 @@
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    server {
+        listen 8080;
+
+        location = /ip{
+            proxy_pass https://icanhazip.com;
+        }
+
+        location / {
+            proxy_pass ${PROXY_TARGET};
+        }
+
+	location /ws/proxy {
+	    proxy_pass http://127.0.0.1:58080;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+	}	
+    }
+}
