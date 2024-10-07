@@ -9,4 +9,4 @@ else
     echo "No .env file found. Using environment variables as is."
 fi
 
-docker push asia.gcr.io/$PROJECT_ID/$IMAGE_NAME 
+docker push asia.gcr.io/$GCP_PROJECT_ID/$GCP_IMAGE_NAME 
