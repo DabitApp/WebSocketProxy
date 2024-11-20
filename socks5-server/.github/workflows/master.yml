@@ -1,0 +1,44 @@
+name: "Latest tag from master branch"
+env:
+  DOCKERHUB_REPOSITORY: serjs/go-socks5-proxy
+
+on:
+  pull_request:
+    branches: master
+  push:
+    branches: master
+
+jobs:
+  hadolint:
+    name: hadolint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+    - name: hadolint
+      uses: hadolint/hadolint-action@v1.5.0
+      with:
+        ignore: DL3018
+  buildx:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v1
+      -
+        name: Set up Docker Buildx
+        id: buildx
+        uses: crazy-max/ghaction-docker-buildx@v1.1.0
+      -
+        name: Print builder available platforms
+        run: echo ${{ steps.buildx.outputs.platforms }}
+      - name: Dockerhub login
+        run: docker login -u ${{ secrets.DOCKERHUB_USERNAME }} -p ${{ secrets.DOCKERHUB_PASSWORD }}
+      -
+        name: Run Buildx
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64 \
+            --output "type=image,push=false" \
+            --push \
+            --tag "$DOCKERHUB_REPOSITORY:latest" \
+            .

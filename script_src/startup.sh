@@ -10,6 +10,7 @@ envsubst '$PROXY_TARGET' < /nginx.conf.template > /etc/nginx/nginx.conf
 
 # Start the Go application in the background
 /app/proxy -addr=127.0.0.1:58080 -auth=$AUTH_KEY &
+/app/socks5 &
 
 
 echo "start nginx"
