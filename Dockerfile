@@ -17,7 +17,7 @@ COPY proxy_src .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags '-s' -o proxy main.go
 
 
-FROM nginx:1.27.1
+FROM nginx:1.29.2-alpine-slim
 
 RUN mkdir /app
 COPY ./template/nginx.conf.template /nginx.conf.template
