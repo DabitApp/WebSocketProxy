@@ -1,5 +1,5 @@
 module websocket-tcp-proxy
 
-go 1.18
+go 1.25
 
 require github.com/gorilla/websocket v1.5.3 // indirect

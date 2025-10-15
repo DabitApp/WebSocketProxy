@@ -7,13 +7,14 @@ COPY socks5-server .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags '-s' -o ./socks5
 
 
-FROM golang:1.23 as builder-2
+FROM golang:1.25 as builder-2
 
 WORKDIR /src
 
 COPY proxy_src .
 
-RUN go mod download && go mod verify && go build -o proxy main.go
+#RUN go mod download && go mod verify
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags '-s' -o proxy main.go
 
 
 FROM nginx:1.27.1
