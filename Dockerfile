@@ -20,6 +20,7 @@ FROM nginx:1.27.1
 
 RUN mkdir /app
 COPY ./template/nginx.conf.template /nginx.conf.template
+COPY ./template/nginx.huanan.template.conf /etc/nginx/conf.d/
 COPY script_src/startup.sh /app
 COPY --from=builder-2 /src/proxy /app
 COPY --from=builder-1 /usr/share/zoneinfo /usr/share/zoneinfo
