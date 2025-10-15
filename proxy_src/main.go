@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"log"
 	"net"
 	"net/http"
-	"sync"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -21,8 +26,10 @@ const (
 )
 
 var (
-	addr    = flag.String("addr", "localhost:8080", "http service address")
-	authKey = flag.String("auth", "", "authentication key")
+	ServiceName     = "dabit-ws-proxy"
+	ShutdownTimeout = 10 * time.Second
+	addr            = flag.String("addr", "localhost:8080", "http service address")
+	authKey         = flag.String("auth", "", "authentication key")
 )
 
 var upgrader = websocket.Upgrader{
@@ -32,18 +39,17 @@ var upgrader = websocket.Upgrader{
 type proxyConnection struct {
 	tcpConn net.Conn
 	target  string
-	mu      sync.Mutex
 }
 
-func (pc *proxyConnection) connect() (net.Conn, error) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
+func (pc *proxyConnection) connect(ctx context.Context) (net.Conn, error) {
 	if pc.tcpConn != nil {
 		return nil, nil // Already connected
 	}
 
-	conn, err := net.Dial("tcp", pc.target)
+	dialer := net.Dialer{
+		Timeout: 20 * time.Second,
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", pc.target)
 	if err != nil {
 		return nil, err
 	}
@@ -54,32 +60,53 @@ func (pc *proxyConnection) connect() (net.Conn, error) {
 }
 
 func (pc *proxyConnection) disconnect() {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
 	if pc.tcpConn != nil {
 		pc.tcpConn.Close()
-		pc.tcpConn = nil
 	}
 }
 
 func (pc *proxyConnection) write(data []byte) error {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
 	if pc.tcpConn == nil {
-		return nil // Ignore if not connected
+		return errors.New("not connected, abort the write")
 	}
 
 	_, err := pc.tcpConn.Write(data)
 	return err
 }
 
+func runHttpServer(srv *http.Server) {
+	log.Printf("%s starting at %s", ServiceName, srv.Addr)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
+
+	// Wait for signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println(ServiceName, "shutting down gracefully...")
+	ctx, cancel := context.WithTimeout(context.Background(), ShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("server shutdown: %s\n", err)
+	}
+	log.Println(ServiceName, "shut down gracefully.")
+}
+
 func main() {
 	flag.Parse()
-	log.Println("proxy server start at ", *addr)
-	http.HandleFunc("/", handleWebSocket)
-	log.Fatal(http.ListenAndServe(*addr, nil))
+	// Create a new ServeMux instead of using the default one
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleWebSocket)
+
+	srv := &http.Server{
+		Addr:    *addr,
+		Handler: mux, // Explicitly set the handler
+	}
+
+	runHttpServer(srv)
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -97,24 +124,87 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// Handshake websocket connection
+	wsClientConnection, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("upgrade error:", err)
 		return
 	}
-	defer conn.Close()
-	
-	log.Println("connection started: ", r.RemoteAddr, r.RequestURI)
+	defer wsClientConnection.Close()
 
-	pc := &proxyConnection{target: target}
-	defer pc.disconnect()
-	initializeTCP(conn, pc)
+	// Initialize proxy connection
+	proxy, err := initializeProxy(r, target)
+	if err != nil {
+		log.Println("initialize proxy error:", err)
+		return
+	}
+	defer proxy.disconnect()
 
-	// Handle WebSocket messages
+	// Write stateOK to websocket
+	err = wsClientConnection.WriteMessage(websocket.BinaryMessage, []byte{stateOK})
+	if err != nil {
+		log.Println("websocket write error:", err)
+		return
+	}
+	//handshake done, now we can start the background context
+	clientContext, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// Test code
+	// go func() {
+	// 	time.Sleep(30 * time.Second)
+	// 	proxy.disconnect()
+	// }()
+	go handleTCPRead(cancel, wsClientConnection, proxy)
+	go handleWebSocketProcess(cancel, wsClientConnection, proxy)
+	<-clientContext.Done()
+	log.Println("client context done")
+}
+
+func initializeProxy(r *http.Request, target string) (*proxyConnection, error) {
+	log.Println("proxy connection started: ", r.RemoteAddr, r.RequestURI)
+	proxy := &proxyConnection{target: target}
+	tcpConn, err := proxy.connect(r.Context())
+	if err != nil {
+		log.Println("tcp connect error:", err)
+		return nil, err
+	}
+	if tcpConn == nil {
+		return nil, errors.New("tcp connect error")
+	}
+	return proxy, nil
+}
+
+func handleTCPRead(cancelContext context.CancelFunc, wsClientConnection *websocket.Conn, proxy *proxyConnection) {
+	defer cancelContext()
+	buffer := make([]byte, 4096)
 	for {
-		messageType, p, err := conn.ReadMessage()
+		if proxy.tcpConn == nil {
+			return
+		}
+
+		n, err := proxy.tcpConn.Read(buffer)
 		if err != nil {
-			log.Println("read error:", err)
+			log.Println("tcp read error:", err)
+			//wsClientConnection.WriteMessage(websocket.BinaryMessage, []byte{stateDisconnect})
+			return
+		}
+
+		message := append([]byte{stateNormal}, buffer[:n]...)
+		err = wsClientConnection.WriteMessage(websocket.BinaryMessage, message)
+		if err != nil {
+			log.Println("websocket write error:", err)
+			return
+		}
+	}
+}
+
+func handleWebSocketProcess(cancelContext context.CancelFunc, wsClientConnection *websocket.Conn, proxy *proxyConnection) {
+	defer cancelContext()
+	for {
+		messageType, p, err := wsClientConnection.ReadMessage()
+		if err != nil {
+			log.Println("websocketread error:", err)
 			return
 		}
 
@@ -125,60 +215,21 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		cmd := p[0]
 		payload := p[1:]
 
+		// 20251015: now we only accept send proxy command
 		switch cmd {
 		case cmdConnect:
-			initializeTCP(conn, pc)
+			//initializeTCP(r.Context(), wsClientConnection, proxy)
+			continue
 		case cmdDisconnect:
-			pc.disconnect()
-			conn.WriteMessage(websocket.BinaryMessage, []byte{stateDisconnect})
+			// for simplicity, just abort the websocket connection
+			return
 		case cmdSend:
-			err := pc.write(payload)
+			err := proxy.write(payload)
 			if err != nil {
 				log.Println("tcp write error:", err)
-				pc.disconnect()
-				conn.WriteMessage(websocket.BinaryMessage, []byte{stateDisconnect})
+				// for simplicity, just abort the websocket connection
+				return
 			}
-		}
-	}
-}
-
-func initializeTCP(wsConn *websocket.Conn, pc *proxyConnection) {
-    tcpConn, err := pc.connect()
-	if err != nil {
-		log.Println("tcp connect error:", err)
-		wsConn.WriteMessage(websocket.BinaryMessage, []byte{stateDisconnect})
-	} else if tcpConn == nil {
-	    return
-	} else {
-		wsConn.WriteMessage(websocket.BinaryMessage, []byte{stateOK})
-		go handleTCPRead(wsConn, pc)
-	}
-}
-
-func handleTCPRead(wsConn *websocket.Conn, pc *proxyConnection) {
-	buffer := make([]byte, 4096)
-	for {
-		pc.mu.Lock()
-		if pc.tcpConn == nil {
-			pc.mu.Unlock()
-			return
-		}
-		tcpConn := pc.tcpConn
-		pc.mu.Unlock()
-
-		n, err := tcpConn.Read(buffer)
-		if err != nil {
-			log.Println("tcp read error:", err)
-			pc.disconnect()
-			wsConn.WriteMessage(websocket.BinaryMessage, []byte{stateDisconnect})
-			return
-		}
-
-		message := append([]byte{stateNormal}, buffer[:n]...)
-		err = wsConn.WriteMessage(websocket.BinaryMessage, message)
-		if err != nil {
-			log.Println("websocket write error:", err)
-			return
 		}
 	}
 }
