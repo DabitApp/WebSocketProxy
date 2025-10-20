@@ -1,4 +1,4 @@
-ARG GOLANG_VERSION="1.16.5"
+ARG GOLANG_VERSION="1.25"
 
 FROM golang:$GOLANG_VERSION-alpine as builder-1
 RUN apk --no-cache add tzdata
@@ -7,7 +7,7 @@ COPY socks5-server .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags '-s' -o ./socks5
 
 
-FROM golang:1.25 as builder-2
+FROM golang:$GOLANG_VERSION-alpine as builder-2
 
 WORKDIR /src
 

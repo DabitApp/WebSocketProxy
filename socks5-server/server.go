@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
-	"github.com/armon/go-socks5"
-	"github.com/caarlos0/env"
+	"dabit.app/socks5/implementation/armon/socks5"
+	"dabit.app/socks5/implementation/caarlos0/env"
 )
 
 type params struct {
@@ -40,8 +43,36 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("Start listening proxy service on port %s\n", cfg.Port)
-	if err := server.ListenAndServe("tcp", ":"+cfg.Port); err != nil {
-		log.Fatal(err)
+	// Create a context that can be cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start server in a goroutine
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("Start listening proxy service on port %s\n", cfg.Port)
+		serverErr <- server.ListenAndServeWithContext(ctx, "tcp", ":"+cfg.Port)
+	}()
+
+	// Wait for either server error or shutdown signal
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			log.Fatal(err)
+		}
+	case sig := <-sigChan:
+		log.Printf("Received signal %v, shutting down gracefully...\n", sig)
+		cancel() // Cancel the context to signal shutdown
+
+		// Wait for server to shutdown gracefully
+		if err := server.Shutdown(); err != nil {
+			log.Printf("Error during shutdown: %v\n", err)
+		} else {
+			log.Println("Server shutdown completed")
+		}
 	}
 }

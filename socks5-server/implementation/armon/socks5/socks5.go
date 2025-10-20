@@ -2,12 +2,19 @@ package socks5
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+)
 
-	"golang.org/x/net/context"
+var (
+	errUnrecognizedAddrType = errors.New("unrecognized address type")
 )
 
 const (
@@ -55,6 +62,10 @@ type Config struct {
 type Server struct {
 	config      *Config
 	authMethods map[uint8]Authenticator
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	shutdown    int32 // atomic boolean: 0 = false, 1 = true
 }
 
 // New creates a new Server and potentially returns an error
@@ -83,8 +94,11 @@ func New(conf *Config) (*Server, error) {
 		conf.Logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{
 		config: conf,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	server.authMethods = make(map[uint8]Authenticator)
@@ -105,21 +119,60 @@ func (s *Server) ListenAndServe(network, addr string) error {
 	return s.Serve(l)
 }
 
+// ListenAndServeWithContext is used to create a listener and serve on it with context
+func (s *Server) ListenAndServeWithContext(ctx context.Context, network, addr string) error {
+	l, err := net.Listen(network, addr)
+	if err != nil {
+		return err
+	}
+	return s.ServeWithContext(ctx, l)
+}
+
 // Serve is used to serve connections from a listener
 func (s *Server) Serve(l net.Listener) error {
+	return s.ServeWithContext(s.ctx, l)
+}
+
+// ServeWithContext is used to serve connections from a listener with context
+func (s *Server) ServeWithContext(ctx context.Context, l net.Listener) error {
+	defer l.Close()
+
 	for {
+		select {
+		case <-ctx.Done():
+			s.config.Logger.Printf("[INFO] socks: Server shutting down due to context cancellation")
+			return ctx.Err()
+		default:
+		}
+
+		// Set a timeout for Accept to allow periodic context checking
+		if tcpListener, ok := l.(*net.TCPListener); ok {
+			tcpListener.SetDeadline(time.Now().Add(time.Second))
+		}
+
 		conn, err := l.Accept()
 		if err != nil {
-			return err
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue // Timeout is expected, check context again
+			}
+			return err // Non-temporary error, likely means the listener is no longer usable
 		}
-		go s.ServeConn(conn)
+
+		s.wg.Go(func() {
+			s.ServeConn(conn)
+		})
 	}
-	return nil
 }
 
 // ServeConn is used to serve a single connection.
 func (s *Server) ServeConn(conn net.Conn) error {
 	defer conn.Close()
+
+	// Check if server is shutting down
+	if atomic.LoadInt32(&s.shutdown) == 1 {
+		return fmt.Errorf("server is shutting down")
+	}
+
 	bufConn := bufio.NewReader(conn)
 
 	// Read the version byte
@@ -131,7 +184,7 @@ func (s *Server) ServeConn(conn net.Conn) error {
 
 	// Ensure we are compatible
 	if version[0] != socks5Version {
-		err := fmt.Errorf("Unsupported SOCKS version: %v", version)
+		err := fmt.Errorf("unsupported SOCKS version: %v", version)
 		s.config.Logger.Printf("[ERR] socks: %v", err)
 		return err
 	}
@@ -139,19 +192,19 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	// Authenticate the connection
 	authContext, err := s.authenticate(conn, bufConn)
 	if err != nil {
-		err = fmt.Errorf("Failed to authenticate: %v", err)
+		err = fmt.Errorf("failed to authenticate: %v", err)
 		s.config.Logger.Printf("[ERR] socks: %v", err)
 		return err
 	}
 
 	request, err := NewRequest(bufConn)
 	if err != nil {
-		if err == unrecognizedAddrType {
+		if errors.Is(err, errUnrecognizedAddrType) {
 			if err := sendReply(conn, addrTypeNotSupported, nil); err != nil {
-				return fmt.Errorf("Failed to send reply: %v", err)
+				return fmt.Errorf("failed to send reply: %v", err)
 			}
 		}
-		return fmt.Errorf("Failed to read destination address: %v", err)
+		return fmt.Errorf("failed to read destination address: %v", err)
 	}
 	request.AuthContext = authContext
 	if client, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
@@ -160,10 +213,67 @@ func (s *Server) ServeConn(conn net.Conn) error {
 
 	// Process the client request
 	if err := s.handleRequest(request, conn); err != nil {
-		err = fmt.Errorf("Failed to handle request: %v", err)
+		err = fmt.Errorf("failed to handle request: %v", err)
 		s.config.Logger.Printf("[ERR] socks: %v", err)
 		return err
 	}
 
 	return nil
+}
+
+// Shutdown gracefully shuts down the server
+func (s *Server) Shutdown() error {
+	if !atomic.CompareAndSwapInt32(&s.shutdown, 0, 1) {
+		return fmt.Errorf("server is already shutting down")
+	}
+
+	// Cancel the context to signal shutdown
+	s.cancel()
+
+	// Wait for all connections to finish with a timeout
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.config.Logger.Printf("[INFO] socks: Server shutdown completed")
+		return nil
+	case <-time.After(30 * time.Second):
+		s.config.Logger.Printf("[WARN] socks: Server shutdown timeout, some connections may not have closed gracefully")
+		return fmt.Errorf("shutdown timeout")
+	}
+}
+
+// ShutdownWithTimeout gracefully shuts down the server with a custom timeout
+func (s *Server) ShutdownWithTimeout(timeout time.Duration) error {
+	if !atomic.CompareAndSwapInt32(&s.shutdown, 0, 1) {
+		return fmt.Errorf("server is already shutting down")
+	}
+
+	// Cancel the context to signal shutdown
+	s.cancel()
+
+	// Wait for all connections to finish with the specified timeout
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.config.Logger.Printf("[INFO] socks: Server shutdown completed")
+		return nil
+	case <-time.After(timeout):
+		s.config.Logger.Printf("[WARN] socks: Server shutdown timeout after %v, some connections may not have closed gracefully", timeout)
+		return fmt.Errorf("shutdown timeout after %v", timeout)
+	}
+}
+
+// IsShutdown returns true if the server is shutting down or has been shut down
+func (s *Server) IsShutdown() bool {
+	return atomic.LoadInt32(&s.shutdown) == 1
 }

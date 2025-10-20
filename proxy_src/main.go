@@ -157,6 +157,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// }()
 	go handleTCPRead(cancel, wsClientConnection, proxy)
 	go handleWebSocketProcess(cancel, wsClientConnection, proxy)
+	go runningPingPong(clientContext, cancel, wsClientConnection)
 	<-clientContext.Done()
 	log.Println("client context done")
 }
@@ -173,6 +174,24 @@ func initializeProxy(r *http.Request, target string) (*proxyConnection, error) {
 		return nil, errors.New("tcp connect error")
 	}
 	return proxy, nil
+}
+
+func runningPingPong(ctx context.Context, cancelContext context.CancelFunc, wsClientConnection *websocket.Conn) {
+	ticker := time.NewTicker(20 * time.Second)
+	defer cancelContext()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			err := wsClientConnection.WriteMessage(websocket.PingMessage, []byte("ping"))
+			if err != nil {
+				log.Println("websocket ping error:", err)
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func handleTCPRead(cancelContext context.CancelFunc, wsClientConnection *websocket.Conn, proxy *proxyConnection) {
