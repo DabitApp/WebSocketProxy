@@ -13,11 +13,11 @@ import (
 var (
 	// ErrNotAStructPtr is returned if you pass something that is not a pointer to a
 	// Struct to Parse
-	ErrNotAStructPtr = errors.New("Expected a pointer to a Struct")
+	ErrNotAStructPtr = errors.New("expected a pointer to a struct")
 	// ErrUnsupportedType if the struct field type is not supported by env
-	ErrUnsupportedType = errors.New("Type is not supported")
+	ErrUnsupportedType = errors.New("type is not supported")
 	// ErrUnsupportedSliceType if the slice element type is not supported by env
-	ErrUnsupportedSliceType = errors.New("Unsupported slice type")
+	ErrUnsupportedSliceType = errors.New("unsupported slice type")
 	// OnEnvVarSet is an optional convenience callback, such as for logging purposes.
 	// If not nil, it's called after successfully setting the given field from the given value.
 	OnEnvVarSet func(reflect.StructField, string)
@@ -114,11 +114,12 @@ func get(field reflect.StructField) (string, error) {
 	val = getOr(key, defaultValue)
 
 	if len(opts) > 0 {
+	Loop:
 		for _, opt := range opts {
 			// The only option supported is "required".
 			switch opt {
 			case "":
-				break
+				break Loop
 			case "required":
 				val, err = getRequired(key)
 			default:
@@ -236,7 +237,7 @@ func handleStruct(field reflect.Value, refType reflect.StructField, value string
 	// Call on the custom parser func
 	data, err := parserFunc(value)
 	if err != nil {
-		return fmt.Errorf("Custom parser error: %v", err)
+		return fmt.Errorf("custom parser error: %v", err)
 	}
 
 	// Set the field to the data returned by the customer parser func
